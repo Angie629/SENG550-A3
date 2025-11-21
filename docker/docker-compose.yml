@@ -1,0 +1,154 @@
+services:
+  # Apache Spark Master
+  spark-master:
+    image: apache/spark:3.4.0-scala2.12-java11-python3-ubuntu
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ../:/workspace
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    networks:
+      - spark-network
+
+  # Apache Spark Worker
+  spark-worker:
+    image: apache/spark:3.4.0-scala2.12-java11-python3-ubuntu
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+    depends_on:
+      - spark-master
+    volumes:
+      - ../:/workspace
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    networks:
+      - spark-network
+
+  # Redis for caching and tracking
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - spark-network
+
+  # PostgreSQL for Airflow metadata
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - spark-network
+
+  # Apache Airflow Webserver
+  airflow-webserver:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-webserver
+    depends_on:
+      - postgres
+      - redis
+    environment: &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 30
+      PYTHONPATH: "/opt/airflow/dags:/workspace"
+      _PIP_ADDITIONAL_REQUIREMENTS: "pyspark==3.4.0 redis==5.0.1"
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/logs:/opt/airflow/logs
+      - ../airflow/plugins:/opt/airflow/plugins
+      - ../:/workspace
+    ports:
+      - "8081:8080"
+    command: webserver
+    user: "airflow"
+    networks:
+      - spark-network
+
+  # Apache Airflow Scheduler
+  airflow-scheduler:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-scheduler
+    depends_on:
+      - postgres
+      - redis
+      - airflow-webserver
+    environment:
+      <<: *airflow-common-env
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/logs:/opt/airflow/logs
+      - ../airflow/plugins:/opt/airflow/plugins
+      - ../:/workspace
+    command: scheduler
+    user: "airflow"
+    networks:
+      - spark-network
+
+  # Airflow Init (run once to set up database)
+  airflow-init:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-init
+    depends_on:
+      - postgres
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_FIRSTNAME: Admin
+      _AIRFLOW_WWW_USER_LASTNAME: User
+      _AIRFLOW_WWW_USER_EMAIL: admin@example.com
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/logs:/opt/airflow/logs
+      - ../airflow/plugins:/opt/airflow/plugins
+      - ../:/workspace
+    command: >
+      bash -c "
+        airflow db init &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+      "
+    user: "airflow"
+    networks:
+      - spark-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  spark-network:
+    driver: bridge
